@@ -329,7 +329,7 @@ def init_database():
     # Настройки по умолчанию
     default_settings = [
         ('referral_bonus', '300'),
-        ('welcome_bonus', '50'),
+        ('welcome_bonus', '0'),
         ('group_id', str(GROUP_ID)),
         ('bot_name', 'K1LOSSEZ Referral Bot'),
         ('min_withdrawal', '100'),
@@ -430,7 +430,7 @@ def get_referral_bonus():
 
 def get_welcome_bonus():
     """Получить стартовый бонус"""
-    return float(get_setting('welcome_bonus', '50'))
+    return float(get_setting('welcome_bonus', '0'))
 
 def get_photo_url(photo_type):
     """Получить URL фото из настроек"""
@@ -646,12 +646,27 @@ async def check_new_user_promos(user_id):
         if used_count >= max_uses:
             continue
         
+        # Проверяем минимальный баланс
+        user = get_user(user_id)
+        if user and min_balance > 0 and user[3] < min_balance:
+            conn.close()
+            return None, f"Для активации необходим минимальный баланс: {min_balance}"
+        
+        # Проверяем для новых пользователей
+        if for_new_users_only == 1:
+            cursor.execute('SELECT COUNT(*) FROM transactions WHERE user_id = ? AND type IN ("referral_bonus", "manual_adjustment")', (user_id,))
+            trans_count = cursor.fetchone()[0] or 0
+            if trans_count > 1:
+                conn.close()
+                return None, "Промокод только для новых пользователей"
+        
         # Проверяем, использовал ли пользователь уже этот промокод
         cursor.execute('SELECT * FROM used_promo_codes WHERE user_id = ? AND promo_code = ?', (user_id, code))
         if cursor.fetchone():
-            continue
+            conn.close()
+            return None, "Вы уже использовали этот промокод"
         
-        # Начисляем бонус
+        # Начисляем баллы
         update_balance(user_id, amount, f'Автобонус для нового пользователя: {code}')
         
         # Обновляем счетчик использований
@@ -664,19 +679,15 @@ async def check_new_user_promos(user_id):
         VALUES (?, ?, ?, ?)
         ''', (user_id, code, current_time, amount))
         
-        # Уведомляем пользователя
-        try:
-            currency = get_currency_info()
-            await bot.send_message(
-                user_id,
-                f"🎁 <b>Специальный бонус для нового пользователя!</b>\n\n"
-                f"💰 Получено: <b>{amount} {currency['name']}</b>\n"
-                f"🎁 Промокод: <code>{code}</code>\n\n"
-                f"Добро пожаловать в наше сообщество!",
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            logger.error(f"Ошибка уведомления пользователя о промокоде: {e}")
+        # Обновляем статистику
+        cursor.execute("SELECT * FROM statistics WHERE date = ?", (current_time[:10],))
+        if cursor.fetchone():
+            cursor.execute("UPDATE statistics SET promo_uses = promo_uses + 1 WHERE date = ?", (current_time[:10],))
+        else:
+            cursor.execute('''
+            INSERT INTO statistics (date, new_users, referrals_count, withdrawals_count, withdrawals_amount, promo_uses)
+            VALUES (?, 0, 0, 0, 0, 1)
+            ''', (current_time[:10],))
     
     conn.commit()
     conn.close()
@@ -824,49 +835,46 @@ def create_withdrawal(user_id, skin_name, pattern, photo_id, amount):
     
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    # Проверяем лимит на вывод в день
-    cursor.execute('''
-    SELECT SUM(amount) FROM withdrawals 
-    WHERE user_id = ? AND status = 'completed' AND date(processed_date) = date(?)
-    ''', (user_id, current_time))
-    
-    daily_withdrawn = cursor.fetchone()[0] or 0
-    max_daily = float(get_setting('max_withdrawal_per_day', '5000'))
-    
-    if daily_withdrawn + amount > max_daily:
-        conn.close()
-        return None, f"Превышен дневной лимит вывода. Сегодня уже выведено: {daily_withdrawn}"
-    
-    # Создаем заявку
-    cursor.execute('''
-    INSERT INTO withdrawals (user_id, skin_name, pattern, photo_id, amount, status, created_date)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, skin_name, pattern, photo_id, amount, 'pending', current_time))
-    
-    withdrawal_id = cursor.lastrowid
-    
-    # Списываем баланс с учетом комиссии
+    # Снимаем баланс с комиссией
     withdrawal_fee = float(get_setting('withdrawal_fee', '0'))
     fee_amount = amount * (withdrawal_fee / 100) if withdrawal_fee > 0 else 0
-    total_amount = amount + fee_amount
     
-    cursor.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (total_amount, user_id))
-    
-    # Записываем транзакции
-    cursor.execute('''
-    INSERT INTO transactions (user_id, amount, type, description, date, status, related_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, -amount, 'withdrawal', f'Заявка на вывод #{withdrawal_id}', current_time, 'pending', withdrawal_id))
-    
-    if fee_amount > 0:
+    try:
+        # Снимаем основную сумму
+        cursor.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, user_id))
+        
+        # Если есть комиссия, снимаем и ее
+        if fee_amount > 0:
+            cursor.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (fee_amount, user_id))
+            
+            cursor.execute('''
+            INSERT INTO transactions (user_id, amount, type, description, date, status, related_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, -fee_amount, 'withdrawal_fee', f'Комиссия за вывод', current_time, 'completed', None))
+        
+        # Создаем запись о выводе
+        cursor.execute('''
+        INSERT INTO withdrawals (user_id, skin_name, pattern, photo_id, amount, status, created_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, skin_name, pattern, photo_id, amount, 'pending', current_time))
+        
+        withdrawal_id = cursor.lastrowid
+        
+        # Записываем транзакцию
         cursor.execute('''
         INSERT INTO transactions (user_id, amount, type, description, date, status, related_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, -fee_amount, 'withdrawal_fee', f'Комиссия за вывод #{withdrawal_id}', current_time, 'completed', withdrawal_id))
-    
-    conn.commit()
-    conn.close()
-    return withdrawal_id, None
+        ''', (user_id, -amount, 'withdrawal', f'Заявка на вывод #{withdrawal_id}', current_time, 'pending', withdrawal_id))
+        
+        conn.commit()
+        conn.close()
+        return withdrawal_id, None
+        
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        logger.error(f"Ошибка создания вывода: {e}")
+        return None, f"Ошибка при создании заявки: {str(e)}"
 
 def get_withdrawals(user_id=None, status=None, limit=50):
     """Получить заявки на вывод"""
@@ -1305,7 +1313,25 @@ async def check_subscription(user_id, channel_id):
 
 async def send_with_photo(chat_id, photo_type, caption, reply_markup=None):
     """Отправить сообщение с фото"""
-    # Сначала проверяем file_id
+    # Сначала проверяем локальный файл
+    photo_path = os.path.join(IMAGES_DIR, f'{photo_type}.jpg')
+    
+    # Если есть локальный файл, используем его
+    if os.path.exists(photo_path):
+        try:
+            photo = FSInputFile(photo_path)
+            message = await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+            return message
+        except Exception as e:
+            logger.error(f"Ошибка отправки локального фото {photo_type}: {e}")
+    
+    # Затем проверяем file_id
     photo_file_id = get_setting(f'photo_{photo_type}_file_id', '')
     
     if photo_file_id:
@@ -1340,22 +1366,6 @@ async def send_with_photo(chat_id, photo_type, caption, reply_markup=None):
         except Exception as e:
             logger.error(f"Ошибка отправки фото по URL ({photo_type}): {e}")
     
-    # Проверяем локальный файл как запасной вариант
-    photo_path = os.path.join(IMAGES_DIR, f'{photo_type}.jpg')
-    if os.path.exists(photo_path):
-        try:
-            photo = FSInputFile(photo_path)
-            message = await bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-            return message
-        except Exception as e:
-            logger.error(f"Ошибка отправки локального фото {photo_type}: {e}")
-    
     # Если фото нет или ошибка - отправляем текст
     message = await bot.send_message(
         chat_id=chat_id,
@@ -1368,22 +1378,19 @@ async def send_with_photo(chat_id, photo_type, caption, reply_markup=None):
 async def edit_with_photo(callback, photo_type, caption, reply_markup=None):
     """Редактировать сообщение с фото"""
     try:
-        # Проверяем, есть ли у сообщения текст
-        if callback.message.text:
-            await callback.message.edit_text(
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-        elif callback.message.caption:
+        # Сначала пытаемся отредактировать сообщение
+        if callback.message.photo:
             await callback.message.edit_caption(
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup
             )
         else:
-            # Если нет ни текста, ни подписи - отправляем новое сообщение
-            await send_with_photo(callback.from_user.id, photo_type, caption, reply_markup)
+            await callback.message.edit_text(
+                text=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
     except Exception as e:
         logger.error(f"Ошибка редактирования сообщения: {e}")
         # Если не удалось отредактировать, отправляем новое
@@ -1532,24 +1539,6 @@ async def cmd_start(message: types.Message):
             )
             return
     
-    # Проверяем группу (с обработкой ошибок)
-    try:
-        member = await bot.get_chat_member(GROUP_ID, user_id)
-        if member.status in ['left', 'kicked']:
-            keyboard = InlineKeyboardBuilder()
-            keyboard.add(InlineKeyboardButton(text="📢 Вступить в группу", url=f"https://t.me/c/{str(abs(GROUP_ID))[4:]}"))
-            keyboard.add(InlineKeyboardButton(text="✅ Я вступил", callback_data="check_group_subscription"))
-            keyboard.adjust(1)
-            
-            await message.answer(
-                "📢 Для использования бота необходимо вступить в нашу группу!\n\nПосле вступления нажмите кнопку ниже:",
-                reply_markup=keyboard.as_markup()
-            )
-            return
-    except Exception as e:
-        logger.error(f"Ошибка проверки группы: {e}")
-        # Пропускаем проверку группы, если есть ошибка
-    
     # Показываем главное меню
     user = get_user(user_id)
     balance = user[3] if user else 0
@@ -1558,7 +1547,7 @@ async def cmd_start(message: types.Message):
     referral_bonus = get_referral_bonus()
     
     caption = (
-        f"👋 <b>Добро пожаловать в {get_setting('bot_name', 'K1LOSS EZ Referral Bot')}!</b>\n\n"
+        f"👋 <b>Добро пожаловать в {get_setting('bot_name', 'K1LOSSEZ Referral Bot')}!</b>\n\n"
         f"👤 <b>Имя:</b> {full_name}\n"
         f"💰 <b>Баланс:</b> {balance} {currency['name']}\n\n"
         f"💎 <b>За каждого реферала:</b> {referral_bonus}г\n\n"
@@ -1887,17 +1876,7 @@ async def process_promo_code(message: Message, state: FSMContext):
         await message.answer(success_text, parse_mode=ParseMode.HTML)
         
         # Отправляем фото с поздравлением
-        promo_photo = get_photo_url('promo')
-        if promo_photo:
-            try:
-                await bot.send_photo(
-                    chat_id=user_id,
-                    photo=promo_photo,
-                    caption=success_text,
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception as e:
-                logger.error(f"Ошибка отправки фото промокода: {e}")
+        await send_with_photo(message.chat.id, 'promo', success_text)
     else:
         error_text = (
             f"❌ <b>Ошибка активации промокода</b>\n\n"
@@ -2045,7 +2024,7 @@ async def check_subscriptions_handler(callback: CallbackQuery):
             if member.status in ['left', 'kicked']:
                 keyboard = InlineKeyboardBuilder()
                 keyboard.add(InlineKeyboardButton(text="📢 Вступить в группу", url=f"https://t.me/c/{str(abs(GROUP_ID))[4:]}"))
-                keyboard.add(InlineKeyboardButton(text="✅ Я вступил", callback_data="check_group_subscription"))
+                keyboard.add(InlineKeyboardButton(text="✅ Я вступил", callback_data="check_channel_subscription"))
                 keyboard.adjust(1)
                 
                 await callback.message.edit_text(
@@ -2337,21 +2316,7 @@ async def process_skin_photo(message: Message, state: FSMContext):
     await message.answer(success_text, parse_mode=ParseMode.HTML)
     
     # Отправляем фото подтверждения
-    withdrawal_photo = get_photo_url('withdrawal')
-    if withdrawal_photo:
-        try:
-            await bot.send_photo(
-                chat_id=user_id,
-                photo=withdrawal_photo,
-                caption=success_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard()
-            )
-        except Exception as e:
-            logger.error(f"Ошибка отправки фото вывода: {e}")
-            await message.answer("🏠 Возврат в главное меню:", reply_markup=main_keyboard())
-    else:
-        await message.answer("🏠 Возврат в главное меню:", reply_markup=main_keyboard())
+    await send_with_photo(user_id, 'withdrawal', success_text, main_keyboard())
 
 @dp.callback_query(F.data == "withdrawal_history")
 async def show_withdrawal_history(callback: CallbackQuery):
@@ -3056,7 +3021,7 @@ async def check_subscriptions_after(callback: CallbackQuery):
     await edit_with_photo(callback, 'welcome', caption, main_keyboard())
     await callback.answer()
 
-@dp.callback_query(F.data == "check_group_subscription")
+@dp.callback_query(F.data == "check_channel_subscription")
 async def check_group_subscription(callback: CallbackQuery):
     """Проверка подписки на группу"""
     user_id = callback.from_user.id
@@ -3182,7 +3147,7 @@ async def admin_users_handler(callback: CallbackQuery):
     stats = get_user_statistics()
     
     stats_text = (
-        f"👥 <b>Управление пользователями</b>\n\n"
+        f"👥 <b>Управление пользователей</b>\n\n"
         f"📊 <b>Статистика:</b>\n"
         f"• Всего пользователей: <b>{stats['total_users']}</b>\n"
         f"• Новых сегодня: <b>{stats['new_today']}</b>\n"
@@ -3453,7 +3418,10 @@ async def manage_photos_handler(callback: CallbackQuery):
     
     for photo_type, photo_name in photo_types:
         photo_url = get_photo_url(photo_type)
-        if photo_url:
+        photo_file_id = get_setting(f'photo_{photo_type}_file_id', '')
+        photo_path = os.path.join(IMAGES_DIR, f'{photo_type}.jpg')
+        
+        if photo_file_id or photo_url or os.path.exists(photo_path):
             photos_text += f"✅ <b>{photo_name}:</b> Установлено\n"
         else:
             photos_text += f"❌ <b>{photo_name}:</b> Не установлено\n"
@@ -5429,12 +5397,12 @@ async def set_bot_name_command(message: Message):
                 "❌ Неверный формат. Используйте:\n"
                 "<code>/set_bot_name Новое имя бота</code>\n\n"
                 "Пример:\n"
-                "<code>/set_bot_name K1LOSS EZ Referral Bot</code>",
+                "<code>/set_bot_name K1LOSSEZ Referral Bot</code>",
                 parse_mode=ParseMode.HTML
             )
             return
         
-        old_name = get_setting('bot_name', 'K1LOSS EZ Referral Bot')
+        old_name = get_setting('bot_name', 'K1LOSSEZ Referral Bot')
         update_setting('bot_name', new_name)
         
         await message.answer(
@@ -5658,14 +5626,56 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # Удаляем старую базу данных, если есть проблемы
-    if os.path.exists('referral_bot.db'):
-        print("⚠️  Удаляю старую базу данных для пересоздания...")
-        os.remove('referral_bot.db')
+    # Проверяем, существует ли БД, если нет - создаем
+    if not os.path.exists('referral_bot.db'):
+        print("📁 Создаю новую базу данных...")
+        init_database()
+    else:
+        print("📁 Загружаю существующую базу данных...")
+        # Проверяем структуру БД и добавляем недостающие таблицы/столбцы
+        conn = sqlite3.connect('referral_bot.db')
+        cursor = conn.cursor()
+        
+        # Проверяем все таблицы
+        tables_to_check = [
+            ('users', '''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    balance REAL DEFAULT 0,
+                    referrals_count INTEGER DEFAULT 0,
+                    referral_from INTEGER DEFAULT 0,
+                    join_date TEXT,
+                    last_activity TEXT,
+                    subscribed_channels TEXT DEFAULT '[]',
+                    total_earned REAL DEFAULT 0,
+                    total_withdrawn REAL DEFAULT 0
+                )
+            '''),
+            ('referral_codes', '''
+                CREATE TABLE IF NOT EXISTS referral_codes (
+                    user_id INTEGER PRIMARY KEY,
+                    referral_code TEXT UNIQUE,
+                    created_date TEXT,
+                    uses_count INTEGER DEFAULT 0
+                )
+            '''),
+            # Добавьте все остальные таблицы здесь...
+        ]
+        
+        for table_name, create_query in tables_to_check:
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            if not cursor.fetchone():
+                print(f"  ➕ Создаю таблицу: {table_name}")
+                cursor.execute(create_query)
+        
+        conn.commit()
+        conn.close()
     
-    # Пересоздаем базу данных
-    init_database()
+    # Загружаем данные из БД
     load_channels_from_db()
     load_admins_from_db()
     
+    # Запускаем бота
     asyncio.run(main())
